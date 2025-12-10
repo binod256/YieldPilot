@@ -112,7 +112,6 @@ function handleYieldScan(input) {
   const bias = riskToleranceBias(rt);
   const chainRisk = chainRiskFactor(chain);
 
-  // Build a synthetic but opinionated opportunity set per asset
   const opportunities = [];
 
   assets.forEach((assetSymbol) => {
@@ -163,7 +162,6 @@ function handleYieldScan(input) {
       // Chain factor nudges risk upward if riskier
       score *= chainRisk;
 
-      // Clamp
       return Math.max(5, Math.min(95, Math.round(score)));
     }
 
@@ -549,7 +547,7 @@ function handlePortfolioPlan(input) {
     estimated_portfolio_apy_mid_pct: Math.round(estimatedPortfolioApyMid * 10) / 10,
     estimated_portfolio_risk_score: estimatedRiskScore,
     buckets_view: bucketsRaw,
-    position_allocations_view: allocations.slice(0, maxPositions), // cap to requested max positions
+    position_allocations_view: allocations.slice(0, maxPositions),
     rebalancing_policy: rebalancing,
     scenario_analysis: scenarioAnalysis,
     validation_passed: valid,
@@ -665,13 +663,12 @@ function handleExecutionBundle(input) {
         notional_estimate_usd: alloc.amount_in,
         size_category: sizeCategory,
         price_impact_hint,
-        slippage_bps,
+        slippage_bps: slippageBps,
         deadline_seconds: deadlineSeconds
       }
     };
   });
 
-  // Basic ETA / gas & risk commentary (synthetic)
   const estimatedGasUsd = Math.round(txs.length * 1.75 * 100) / 100;
   const operationalRisks = [
     'Route selection is synthetic; validate routers and paths before signing.',
@@ -775,7 +772,6 @@ function handlePositionHealth(input) {
 
   const snapshots = positions.map((pos) => {
     const threshold = pos.health_threshold;
-    // Synthetic scoring: base depends on threshold (tighter threshold -> we mentally assume closer to edge)
     const baseHealth = threshold >= 80 ? 72 : threshold >= 60 ? 78 : 85;
     const liquidationBufferPct =
       baseHealth >= 80 ? 30 : baseHealth >= 70 ? 20 : 10;
@@ -815,7 +811,6 @@ function handlePositionHealth(input) {
       );
     }
 
-    // Hedging suggestion (synthetic)
     recommendedActions.push(
       'If using perps/options elsewhere, tag this position as reference and consider offsetting directional risk.'
     );
@@ -911,7 +906,6 @@ function handleBacktest(input) {
   const initialCapital = input.initial_capital_usd || 0;
   const actions = input.simulated_actions || [];
 
-  // Time horizon
   const start = new Date(input.backtest_start_utc);
   const end = new Date(input.backtest_end_utc);
   const days =
@@ -919,12 +913,10 @@ function handleBacktest(input) {
       ? 30
       : Math.max(1, Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)));
 
-  // Heuristic PnL: more actions + longer horizon → more dispersion
   const complexityFactor = Math.min(3, Math.max(0.5, actions.length / 10));
   const baseAnnualReturn =
     complexityFactor <= 0.8 ? 0.08 : complexityFactor <= 1.5 ? 0.18 : 0.3;
 
-  // Introduce synthetic edge / drag
   const syntheticEdge =
     strategyName.toLowerCase().includes('delta-neutral') ||
     strategyName.toLowerCase().includes('market-neutral')
@@ -959,7 +951,6 @@ function handleBacktest(input) {
       ? ((annualizedReturnPct - 5) / volatilityPct).toFixed(2)
       : '0.00';
 
-  // Equity curve: start, 25%, 50%, 75%, end
   const steps = [0, 0.25, 0.5, 0.75, 1];
   const equityCurve = steps.map((f) => {
     const t = new Date(
@@ -1184,6 +1175,7 @@ async function main() {
 
     onEvaluate: async (job) => {
       console.log('📊 onEvaluate called for job:', job.id, 'phase:', job.phase);
+      // Optional: add evaluator logic later
     }
   });
 
