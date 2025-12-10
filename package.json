@@ -1,24 +1,41 @@
 {
-  "name": "acp-provider",
+  "name": "defi-yield-resources",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "start": "node seller.js",
-    "start:seller": "node seller.js",
-    "start:resources": "node resources-server.js"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "description": "Resource server for DeFi Yield Optimizer ACP agent—provides chain risk, asset profiles, and yield risk playbook endpoints.",
+  "main": "resources-server.js",
   "type": "commonjs",
+  "scripts": {
+    "start": "node resources-server.js",
+    "dev": "nodemon resources-server.js"
+  },
+  "keywords": [
+    "defi",
+    "yield",
+    "resource-server",
+    "virtuals",
+    "acp",
+    "agent",
+    "render"
+  ],
+  "author": "Binod",
+  "license": "MIT",
   "dependencies": {
-    "@virtuals-protocol/acp-node": "^0.3.0-beta.13",
-    "ajv": "^8.17.1",
-    "ajv-formats": "^3.0.1",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.3",
-    "ethers": "^6.15.0",
-    "express": "^5.2.1"
-  }
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/binod256/saique-resources-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/binod256/saique-resources-server/issues"
+  },
+  "homepage": "https://github.com/binod256/saique-resources-server#readme"
 }
