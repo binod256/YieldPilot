@@ -76,24 +76,41 @@ function validateYieldScan(input) {
   const errors = [];
 
   if (!ensureString(input.client_agent_id)) {
-    errors.push(validationError('client_agent_id must be string', 'client_agent_id'));
+    errors.push(
+      validationError('client_agent_id must be string', 'client_agent_id')
+    );
   }
+
   if (!ensureString(input.chain)) {
     errors.push(validationError('chain must be string', 'chain'));
   }
+
   if (!ensureArray(input.assets)) {
-    errors.push(validationError('assets must be array of strings', 'assets'));
+    errors.push(
+      validationError('assets must be array of strings', 'assets')
+    );
   } else if (!input.assets.every(ensureString)) {
-    errors.push(validationError('assets items must be strings', 'assets'));
+    errors.push(
+      validationError('assets items must be strings', 'assets')
+    );
   }
+
   if (!ensureString(input.risk_tolerance)) {
-    errors.push(validationError('risk_tolerance must be string', 'risk_tolerance'));
+    errors.push(
+      validationError('risk_tolerance must be string', 'risk_tolerance')
+    );
   }
+
   if (!ensureNumber(input.min_tvl_usd)) {
-    errors.push(validationError('min_tvl_usd must be number', 'min_tvl_usd'));
+    errors.push(
+      validationError('min_tvl_usd must be number', 'min_tvl_usd')
+    );
   }
+
   if (!ensureNumber(input.lookback_hours)) {
-    errors.push(validationError('lookback_hours must be number', 'lookback_hours'));
+    errors.push(
+      validationError('lookback_hours must be number', 'lookback_hours')
+    );
   }
 
   return errors;
@@ -238,7 +255,7 @@ function handleYieldScan(input) {
         asset: assetSymbol,
         asset_type: assetType,
         venue_type: v.venue_type,
-        risk_band: v.level, // low / medium / high
+        risk_band: v.level,
         estimated_apy: estApy,
         tvl_usd: v.tvl,
         risk_score: finalRiskScore,
@@ -247,15 +264,18 @@ function handleYieldScan(input) {
         qualitative_summary: v.description,
         fit_explanation: (() => {
           if (rt === 'conservative') {
-            if (v.level === 'low')
+            if (v.level === 'low') {
               return 'Aligned with conservative profile; focus on principal preservation and sustainable yield.';
-            if (v.level === 'medium')
+            }
+            if (v.level === 'medium') {
               return 'Borderline fit; could be used as a small satellite allocation if capital is segmented.';
+            }
             return 'Not recommended for conservative profile; risk / reward skew is too aggressive.';
           }
           if (rt === 'aggressive') {
-            if (v.level === 'high')
+            if (v.level === 'high') {
               return 'Good fit for degen bucket with tight risk monitoring and sizing discipline.';
+            }
             return 'Core position candidate to anchor portfolio while keeping optionality for higher-risk legs.';
           }
           return 'Candidate venue for balanced risk; size within overall risk budget and ensure monitoring alerts.';
@@ -277,7 +297,7 @@ function handleYieldScan(input) {
         ? b.estimated_apy - b.risk_score * 0.2
         : rt === 'aggressive'
         ? b.estimated_apy * 1.3 - b.risk_score * 0.1
-        : b.estimated_apy - b.risk_score * 0.15);
+        : b.estimated_apy - b.estimated_apy * 0.15);
     return bUtil - aUtil;
   });
 
@@ -596,7 +616,7 @@ function validateExecutionBundle(input) {
     });
   }
 
-  // Treat these as OPTIONAL global knobs; only validate type if present.
+  // Optional global knobs; only type-check if present
   if (input.slippage_bps !== undefined && !ensureNumber(input.slippage_bps)) {
     errors.push(validationError('slippage_bps must be number when provided', 'slippage_bps'));
   }
@@ -664,7 +684,7 @@ function handleExecutionBundle(input) {
       to: `0xRouterOrProtocol${idx.toString().padStart(2, '0')}...`,
       data: `0x${(1000 + idx).toString(16)}deadbeef`,
       value: '0',
-      gas_limit_hint: actionType === 'swap' ? 220_000 : 350_000,
+      gas_limit_hint: actionType === 'swap' ? 220000 : 350000,
       meta: {
         chain,
         venue: alloc.venue,
@@ -680,7 +700,8 @@ function handleExecutionBundle(input) {
   });
 
   const estimatedGasUsd = Math.round(txs.length * 1.75 * 100) / 100;
-  const operationalRisks = [
+
+  const operational_risks = [
     'Route selection is synthetic; validate routers and paths before signing.',
     'Ensure slippage and deadlines are aligned with current liquidity conditions.',
     'Run a dry-run / simulation on test environment if changing venues or assets.'
