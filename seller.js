@@ -1,14 +1,14 @@
-// seller.js — DeFi Yield Optimizer Provider (V2 ACP client, rich deliverables)
+// seller.js — YieldPilot DeFi Provider (matches given requirements & deliverables)
 require('dotenv').config();
 
 const AcpClientModule = require('@virtuals-protocol/acp-node');
 const AcpClient = AcpClientModule.default;
 const { AcpContractClientV2 } = AcpClientModule;
 
-// In-memory cache for job metadata between phase 1 and phase 3
+// Simple in-memory cache for job metadata
 const jobMetadata = new Map();
 
-// ---------- Small helper utilities ----------
+/* ---------------------- Helper utilities ---------------------- */
 
 function nowIso() {
   return new Date().toISOString();
@@ -34,305 +34,161 @@ function validationError(message, field) {
   return { message, field };
 }
 
-// DeFi-ish helpers (no on-chain calls, just heuristics)
+/* --------------------- JOB 1: yield_scan_and_ranking --------------------- */
+/*
+Requirement (summary):
+- client_agent_id: string
+- chain: string
+- assets: string[]
+- risk_tolerance: string
+- min_tvl_usd: number
+- lookback_hours: number
 
-function classifyAsset(symbol) {
-  const s = (symbol || '').toUpperCase();
-  if (['USDC', 'USDT', 'DAI', 'FRAX', 'LUSD'].includes(s)) {
-    return 'stablecoin';
+Deliverable (summary):
+- job_name: "yield_scan_and_ranking"
+- chain: string
+- assets: string[]
+- timestamp_utc: string
+- results: array of {
+    protocol, pool_address, asset, estimated_apy (number),
+    tvl_usd (string), risk_score (number), strategy_hint (string)
   }
-  if (['ETH', 'WETH', 'WBTC'].includes(s)) {
-    return 'bluechip';
-  }
-  if (s.includes('-LP') || s.includes('/')) {
-    return 'lp_token';
-  }
-  return 'long_tail';
-}
-
-function chainRiskFactor(chain) {
-  const c = (chain || '').toLowerCase();
-  if (c.includes('mainnet') || c === 'ethereum') return 0.8; // safer
-  if (c.includes('base') || c.includes('arbitrum') || c.includes('optimism')) return 1.0;
-  return 1.2; // unknown / higher beta
-}
-
-function riskToleranceBias(riskTolerance) {
-  switch (riskTolerance) {
-    case 'conservative':
-      return { apyBoost: -3, riskBoost: -15 };
-    case 'balanced':
-      return { apyBoost: 0, riskBoost: 0 };
-    case 'aggressive':
-      return { apyBoost: +5, riskBoost: +10 };
-    default:
-      return { apyBoost: 0, riskBoost: 0 };
-  }
-}
-
-// ---------- JOB 1: yield_scan_and_ranking ----------
+*/
 
 function validateYieldScan(input) {
   const errors = [];
 
   if (!ensureString(input.client_agent_id)) {
-    errors.push(
-      validationError('client_agent_id must be string', 'client_agent_id')
-    );
+    errors.push(validationError('client_agent_id must be string', 'client_agent_id'));
   }
-
   if (!ensureString(input.chain)) {
     errors.push(validationError('chain must be string', 'chain'));
   }
-
   if (!ensureArray(input.assets)) {
-    errors.push(
-      validationError('assets must be array of strings', 'assets')
-    );
+    errors.push(validationError('assets must be array of strings', 'assets'));
   } else if (!input.assets.every(ensureString)) {
-    errors.push(
-      validationError('assets items must be strings', 'assets')
-    );
+    errors.push(validationError('assets items must be strings', 'assets'));
   }
-
   if (!ensureString(input.risk_tolerance)) {
-    errors.push(
-      validationError('risk_tolerance must be string', 'risk_tolerance')
-    );
+    errors.push(validationError('risk_tolerance must be string', 'risk_tolerance'));
   }
-
   if (!ensureNumber(input.min_tvl_usd)) {
-    errors.push(
-      validationError('min_tvl_usd must be number', 'min_tvl_usd')
-    );
+    errors.push(validationError('min_tvl_usd must be number', 'min_tvl_usd'));
   }
-
   if (!ensureNumber(input.lookback_hours)) {
-    errors.push(
-      validationError('lookback_hours must be number', 'lookback_hours')
-    );
+    errors.push(validationError('lookback_hours must be number', 'lookback_hours'));
   }
 
   return errors;
 }
 
+function syntheticRiskFromApy(apy, tvl, minTvl) {
+  // Very simple heuristic: higher APY + lower TVL => higher risk
+  let score = 20;
+
+  if (apy > 20) score += 20;
+  else if (apy > 10) score += 10;
+  else if (apy > 5) score += 5;
+
+  if (tvl < minTvl * 2) score += 15;
+  else if (tvl < minTvl * 5) score += 5;
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
 function handleYieldScan(input) {
   const errors = validateYieldScan(input);
-  const valid = errors.length === 0;
+  const validationPassed = errors.length === 0;
 
   const chain = input.chain || 'unknown';
-  const assets = Array.isArray(input.assets) ? input.assets : [];
-  const minTvl = input.min_tvl_usd || 0;
-  const lookback = input.lookback_hours || 24;
-  const rt = input.risk_tolerance || 'balanced';
+  const assets = ensureArray(input.assets) ? input.assets : [];
+  const minTvl = ensureNumber(input.min_tvl_usd) ? input.min_tvl_usd : 50000;
+  const rt = input.risk_tolerance || 'moderate';
 
-  const bias = riskToleranceBias(rt);
-  const chainRisk = chainRiskFactor(chain);
-
-  const opportunities = [];
+  const results = [];
 
   assets.forEach((assetSymbol) => {
-    const assetType = classifyAsset(assetSymbol);
+    const baseName = assetSymbol.toUpperCase();
 
-    // Base APY bands by asset type
-    let baseLowRiskApy;
-    let baseMediumRiskApy;
-    let baseHighRiskApy;
-    switch (assetType) {
-      case 'stablecoin':
-        baseLowRiskApy = 3;
-        baseMediumRiskApy = 6;
-        baseHighRiskApy = 12;
-        break;
-      case 'bluechip':
-        baseLowRiskApy = 4;
-        baseMediumRiskApy = 10;
-        baseHighRiskApy = 20;
-        break;
-      case 'lp_token':
-        baseLowRiskApy = 8;
-        baseMediumRiskApy = 20;
-        baseHighRiskApy = 45;
-        break;
-      case 'long_tail':
-      default:
-        baseLowRiskApy = 6;
-        baseMediumRiskApy = 18;
-        baseHighRiskApy = 60;
-        break;
-    }
-
-    const tvlFloor = Math.max(minTvl, 50_000);
-    const tvlMid = tvlFloor * 5;
-    const tvlHigh = tvlFloor * 25;
-
-    function buildRiskScore(level, tvl) {
-      let score;
-      if (level === 'low') score = 20;
-      else if (level === 'medium') score = 45;
-      else score = 70;
-
-      // Higher TVL → slightly lower risk
-      if (tvl >= tvlHigh) score -= 5;
-      else if (tvl >= tvlMid) score -= 2;
-
-      // Chain factor nudges risk upward if riskier
-      score *= chainRisk;
-
-      return Math.max(5, Math.min(95, Math.round(score)));
-    }
-
-    function buildRiskBreakdown(level, tvl, assetTypeInner) {
-      const base = {
-        smart_contract_risk: 0,
-        liquidity_risk: 0,
-        depeg_risk: 0,
-        impermanent_loss_risk: 0
-      };
-
-      if (level === 'low') {
-        base.smart_contract_risk = 15;
-        base.liquidity_risk = tvlHigh <= tvl ? 10 : 20;
-      } else if (level === 'medium') {
-        base.smart_contract_risk = 30;
-        base.liquidity_risk = tvlHigh <= tvl ? 20 : 35;
-      } else {
-        base.smart_contract_risk = 45;
-        base.liquidity_risk = tvlHigh <= tvl ? 30 : 45;
-      }
-
-      if (assetTypeInner === 'stablecoin') {
-        base.depeg_risk = level === 'low' ? 5 : level === 'medium' ? 15 : 25;
-      } else if (assetTypeInner === 'lp_token') {
-        base.impermanent_loss_risk = level === 'low' ? 20 : level === 'medium' ? 35 : 50;
-      } else if (assetTypeInner === 'long_tail') {
-        base.depeg_risk = level === 'low' ? 10 : level === 'medium' ? 25 : 40;
-      }
-
-      return base;
-    }
-
-    const variants = [
+    // Construct three synthetic venues per asset
+    const venues = [
       {
-        level: 'low',
         protocol: 'SafeLend',
-        description: 'Conservative lending / borrowing market on battle-tested lending protocol.',
-        apyBase: baseLowRiskApy,
-        tvl: tvlHigh,
-        venue_type: 'lending'
+        apy: rt === 'aggressive' ? 6 : 3,
+        tvl: minTvl * 10,
+        hint: `Stable ${baseName} lending, lower risk and modest yield.`
       },
       {
-        level: 'medium',
         protocol: 'YieldDex',
-        description: 'DEX pool or boosted lending vault with moderate incentives.',
-        apyBase: baseMediumRiskApy,
-        tvl: tvlMid,
-        venue_type: assetType === 'lp_token' ? 'lp' : 'dex_pool'
+        apy: rt === 'conservative' ? 8 : 12,
+        tvl: minTvl * 5,
+        hint: `DEX / LP style yield for ${baseName} with balanced risk-reward.`
       },
       {
-        level: 'high',
-        protocol: 'DeFiTurbo',
-        description:
-          'High-incentive farm with non-trivial smart-contract and liquidity risk. For degen bucket only.',
-        apyBase: baseHighRiskApy,
-        tvl: tvlFloor,
-        venue_type: 'structured_farm'
+        protocol: 'TurboFarm',
+        apy: rt === 'aggressive' ? 35 : 25,
+        tvl: minTvl * 2,
+        hint: `Incentivized farm for ${baseName} with substantially higher risk.`
       }
     ];
 
-    variants.forEach((v) => {
-      const estApy = Math.max(
-        0.1,
-        Math.round((v.apyBase + bias.apyBoost) * 10) / 10
-      );
-      const riskScore = buildRiskScore(v.level, v.tvl) + bias.riskBoost;
-      const finalRiskScore = Math.max(5, Math.min(95, Math.round(riskScore)));
-
-      opportunities.push({
+    venues.forEach((v, idx) => {
+      const riskScore = syntheticRiskFromApy(v.apy, v.tvl, minTvl);
+      results.push({
         protocol: v.protocol,
-        pool_address: `0x${v.protocol.slice(0, 6)}${assetSymbol.slice(0, 4)}Pool...`,
-        chain,
-        asset: assetSymbol,
-        asset_type: assetType,
-        venue_type: v.venue_type,
-        risk_band: v.level,
-        estimated_apy: estApy,
-        tvl_usd: v.tvl,
-        risk_score: finalRiskScore,
-        risk_breakdown: buildRiskBreakdown(v.level, v.tvl, assetType),
-        lookback_hours_used: lookback,
-        qualitative_summary: v.description,
-        fit_explanation: (() => {
-          if (rt === 'conservative') {
-            if (v.level === 'low') {
-              return 'Aligned with conservative profile; focus on principal preservation and sustainable yield.';
-            }
-            if (v.level === 'medium') {
-              return 'Borderline fit; could be used as a small satellite allocation if capital is segmented.';
-            }
-            return 'Not recommended for conservative profile; risk / reward skew is too aggressive.';
-          }
-          if (rt === 'aggressive') {
-            if (v.level === 'high') {
-              return 'Good fit for degen bucket with tight risk monitoring and sizing discipline.';
-            }
-            return 'Core position candidate to anchor portfolio while keeping optionality for higher-risk legs.';
-          }
-          return 'Candidate venue for balanced risk; size within overall risk budget and ensure monitoring alerts.';
-        })()
+        pool_address: `0x${baseName.slice(0, 4)}${idx.toString().padStart(2, '0')}Pool`,
+        asset: baseName,
+        estimated_apy: v.apy,
+        tvl_usd: String(Math.round(v.tvl)), // deliverable expects string
+        risk_score: riskScore,
+        strategy_hint: v.hint
       });
     });
   });
 
-  // Rank by "utility" depending on risk_tolerance
-  const utilitySorted = [...opportunities].sort((a, b) => {
-    const aUtil =
-      (rt === 'conservative'
-        ? a.estimated_apy - a.risk_score * 0.2
-        : rt === 'aggressive'
-        ? a.estimated_apy * 1.3 - a.risk_score * 0.1
-        : a.estimated_apy - a.risk_score * 0.15);
-    const bUtil =
-      (rt === 'conservative'
-        ? b.estimated_apy - b.risk_score * 0.2
-        : rt === 'aggressive'
-        ? b.estimated_apy * 1.3 - b.risk_score * 0.1
-        : b.estimated_apy - b.estimated_apy * 0.15);
-    return bUtil - aUtil;
+  // Sort by APY descending, then lower risk
+  results.sort((a, b) => {
+    if (b.estimated_apy === a.estimated_apy) {
+      return a.risk_score - b.risk_score;
+    }
+    return b.estimated_apy - a.estimated_apy;
   });
-
-  const bestLowRisk = utilitySorted.find((o) => o.risk_band === 'low');
-  const bestMaxApy = [...utilitySorted].sort(
-    (a, b) => b.estimated_apy - a.estimated_apy
-  )[0];
-
-  const portfolioHints = {
-    core_yield_candidate: bestLowRisk || null,
-    max_apy_candidate: bestMaxApy || null,
-    diversification_comment:
-      opportunities.length > 0
-        ? 'Mix 1–2 core venues (low/medium risk) with tightly sized exposure to a single high-risk farm if your mandate allows.'
-        : 'No venues constructed; check input assets / parameters.'
-  };
 
   return {
     job_name: 'yield_scan_and_ranking',
     chain,
     assets,
     timestamp_utc: nowIso(),
-    risk_tolerance: rt,
-    min_tvl_usd_applied: minTvl,
-    opportunities_ranked: utilitySorted,
-    portfolio_hints: portfolioHints,
-    validation_passed: valid,
+    results,
+    // extra (not required but useful):
+    validation_passed: validationPassed,
     validation_errors: errors
   };
 }
 
-// ---------- JOB 2: portfolio_yield_allocation_plan ----------
+/* ----------------- JOB 2: portfolio_yield_allocation_plan ----------------- */
+/*
+Requirement:
+- client_agent_id, chain, starting_capital_usd, risk_tolerance, target_horizon_days, preferences
+- preferences: { allow_leverage (bool), allow_lockups (bool), max_positions (number) }
+
+Deliverable:
+- job_name: "portfolio_yield_allocation_plan"
+- chain, starting_capital_usd, risk_tolerance, timestamp_utc,
+  estimated_portfolio_apy (number),
+  estimated_risk_score (number),
+  allocations: [
+    {
+      protocol, pool_address, asset,
+      allocation_usd, allocation_percent,
+      est_apy, notes
+    }
+  ]
+*/
 
 function validatePortfolioPlan(input) {
   const errors = [];
+
   if (!ensureString(input.client_agent_id)) {
     errors.push(validationError('client_agent_id must be string', 'client_agent_id'));
   }
@@ -340,14 +196,19 @@ function validatePortfolioPlan(input) {
     errors.push(validationError('chain must be string', 'chain'));
   }
   if (!ensureNumber(input.starting_capital_usd)) {
-    errors.push(validationError('starting_capital_usd must be number', 'starting_capital_usd'));
+    errors.push(
+      validationError('starting_capital_usd must be number', 'starting_capital_usd')
+    );
   }
   if (!ensureString(input.risk_tolerance)) {
     errors.push(validationError('risk_tolerance must be string', 'risk_tolerance'));
   }
   if (!ensureNumber(input.target_horizon_days)) {
-    errors.push(validationError('target_horizon_days must be number', 'target_horizon_days'));
+    errors.push(
+      validationError('target_horizon_days must be number', 'target_horizon_days')
+    );
   }
+
   if (typeof input.preferences !== 'object' || input.preferences === null) {
     errors.push(validationError('preferences must be object', 'preferences'));
   } else {
@@ -368,217 +229,151 @@ function validatePortfolioPlan(input) {
       );
     }
   }
+
   return errors;
 }
 
 function handlePortfolioPlan(input) {
   const errors = validatePortfolioPlan(input);
-  const valid = errors.length === 0;
+  const validationPassed = errors.length === 0;
 
-  const capital = input.starting_capital_usd || 0;
   const chain = input.chain || 'unknown';
-  const rt = input.risk_tolerance || 'balanced';
-  const horizonDays = input.target_horizon_days || 30;
+  const capital = ensureNumber(input.starting_capital_usd)
+    ? input.starting_capital_usd
+    : 0;
+  const rt = input.risk_tolerance || 'moderate';
   const prefs = input.preferences || {
     allow_leverage: false,
     allow_lockups: false,
     max_positions: 3
   };
 
-  // Define buckets: core, satellite, experimental
-  let coreWeight, satelliteWeight, experimentalWeight;
-  if (rt === 'conservative') {
-    coreWeight = 0.75;
-    satelliteWeight = 0.2;
-    experimentalWeight = 0.05;
-  } else if (rt === 'aggressive') {
-    coreWeight = 0.4;
-    satelliteWeight = 0.35;
-    experimentalWeight = 0.25;
-  } else {
-    coreWeight = 0.6;
-    satelliteWeight = 0.25;
-    experimentalWeight = 0.15;
-  }
-
-  if (!prefs.allow_lockups) {
-    // Reduce experimental bucket if lockups are disallowed
-    experimentalWeight *= 0.5;
-    const deficit = 0.25 * experimentalWeight;
-    coreWeight += deficit;
-    satelliteWeight += deficit;
-  }
-
-  // Normalize just in case
-  const totalWeight = coreWeight + satelliteWeight + experimentalWeight || 1;
-  coreWeight /= totalWeight;
-  satelliteWeight /= totalWeight;
-  experimentalWeight /= totalWeight;
-
   const maxPositions = Math.max(1, Math.round(prefs.max_positions));
-  const chainRisk = chainRiskFactor(chain);
 
-  function buildBucketAlloc(name, weight, archetype) {
-    const allocUsd = capital * weight;
-    if (allocUsd <= 0) return null;
-
-    let estApyMid;
-    let riskScore;
-    if (archetype === 'core') {
-      estApyMid = rt === 'aggressive' ? 8 : rt === 'conservative' ? 4 : 6;
-      riskScore = 25 * chainRisk;
-    } else if (archetype === 'satellite') {
-      estApyMid = rt === 'aggressive' ? 18 : 12;
-      riskScore = 45 * chainRisk;
-    } else {
-      estApyMid = rt === 'aggressive' ? 35 : 25;
-      riskScore = 70 * chainRisk;
-    }
-
-    const estApyLow = estApyMid * 0.6;
-    const estApyHigh = estApyMid * 1.4;
-
-    return {
-      bucket_name: name,
-      archetype,
-      allocation_usd: Math.round(allocUsd * 100) / 100,
-      allocation_percent: Math.round(weight * 1000) / 10,
-      expected_apy_range_pct: {
-        low: Math.round(estApyLow * 10) / 10,
-        mid: Math.round(estApyMid * 10) / 10,
-        high: Math.round(estApyHigh * 10) / 10
-      },
-      risk_score: Math.round(Math.min(95, riskScore)),
-      example_instruments:
-        archetype === 'core'
-          ? ['Blue-chip stablecoin lending on battle-tested protocol']
-          : archetype === 'satellite'
-          ? ['ETH or blue-chip perp / vault', 'LP in large-cap DEX pool']
-          : ['Long-tail farm with capped sizing', 'High incentive LP with strict stop-loss rules'],
-      guardrails: (() => {
-        if (archetype === 'core') {
-          return [
-            'No leverage or only mild leverage (<= 1.3x) if explicitly allowed.',
-            'Liquidity depth / TVL must be above internal threshold.',
-            'Protocol must have public audits or strong battle-tested history.'
-          ];
-        }
-        if (archetype === 'satellite') {
-          return [
-            'Size each position so that a total loss does not break portfolio risk budget.',
-            'Require on-chain activity / volume above minimal threshold.',
-            'Monitor funding / rewards for sudden cliffs.'
-          ];
-        }
-        return [
-          'Treat as “degen bucket”; assume potential near-total loss.',
-          'Isolate in separate address / sub-account where possible.',
-          'Explicitly tag these positions for elevated monitoring frequency.'
-        ];
-      })()
-    };
+  // Simple bucket weights depending on risk_tolerance
+  let weights;
+  if (rt === 'conservative') {
+    weights = [0.7, 0.25, 0.05]; // core, growth, degen
+  } else if (rt === 'aggressive') {
+    weights = [0.4, 0.4, 0.2];
+  } else {
+    // moderate
+    weights = [0.55, 0.3, 0.15];
   }
 
-  const bucketsRaw = [
-    buildBucketAlloc('Core yield (principal preservation focus)', coreWeight, 'core'),
-    buildBucketAlloc('Satellite directional yield', satelliteWeight, 'satellite'),
-    buildBucketAlloc('Experimental / degen bucket', experimentalWeight, 'experimental')
-  ].filter(Boolean);
+  const [wCore, wGrowth, wDegen] = weights;
 
-  // Flatten into up to max_positions "slots"
-  const allocations = [];
-  bucketsRaw.forEach((bucket) => {
-    const splits = Math.max(1, Math.min(maxPositions, 2));
-    const perSlotUsd = bucket.allocation_usd / splits;
-    for (let i = 0; i < splits; i++) {
-      allocations.push({
-        protocol_hint:
-          bucket.archetype === 'core'
-            ? 'SafeLend (stablecoin lending)'
-            : bucket.archetype === 'satellite'
-            ? 'YieldDex (blue-chip LP / vault)'
-            : 'DeFiTurbo (high-incentive farm)',
-        chain,
-        asset_hint:
-          bucket.archetype === 'core'
-            ? 'USDC / USDT'
-            : bucket.archetype === 'satellite'
-            ? 'WETH / ETH-USD LP'
-            : 'volatile / long-tail token or LP',
-        bucket_name: bucket.bucket_name,
-        archetype: bucket.archetype,
-        allocation_usd: Math.round(perSlotUsd * 100) / 100,
-        allocation_percent_of_portfolio: Math.round(
-          (perSlotUsd / capital) * 1000
-        ) / 10,
-        expected_apy_range_pct: bucket.expected_apy_range_pct,
-        risk_score: bucket.risk_score,
-        guardrails: bucket.guardrails
-      });
-    }
-  });
+  const legs = [];
 
-  const estimatedPortfolioApyMid = (() => {
-    if (capital <= 0) return 0;
-    return (
-      bucketsRaw.reduce(
-        (acc, b) => acc + b.expected_apy_range_pct.mid * (b.allocation_usd / capital),
-        0
-      ) || 0
+  function pushLeg(protocol, asset, w, baseApy, noteSuffix) {
+    const allocationUsd = capital * w;
+    if (allocationUsd <= 0) return;
+
+    const estApy = baseApy;
+    const allocationPercent = w * 100;
+
+    legs.push({
+      protocol,
+      pool_address: `0x${protocol.slice(0, 4)}${asset.slice(0, 3)}Pool`,
+      asset,
+      allocation_usd: Math.round(allocationUsd * 100) / 100,
+      allocation_percent: Math.round(allocationPercent * 10) / 10,
+      est_apy: estApy,
+      notes: noteSuffix
+    });
+  }
+
+  // Core leg – stable, non-levered
+  pushLeg(
+    'SafeLend',
+    'USDC',
+    wCore,
+    rt === 'aggressive' ? 7 : rt === 'conservative' ? 3 : 5,
+    'Core stablecoin lending leg focused on principal preservation.'
+  );
+
+  // Growth leg – blue-chip yield
+  pushLeg(
+    'YieldDex',
+    'WETH',
+    wGrowth,
+    rt === 'aggressive' ? 15 : 10,
+    'Growth leg with blue-chip exposure via LPs or vaults.'
+  );
+
+  // Degen leg – only if prefs allow
+  if (wDegen > 0 && (prefs.allow_leverage || prefs.allow_lockups)) {
+    pushLeg(
+      'TurboFarm',
+      'VOL',
+      wDegen,
+      rt === 'aggressive' ? 35 : 25,
+      'Higher-risk, higher-reward leg sized as a smaller portion of capital.'
     );
-  })();
+  }
 
-  const estimatedRiskScore = (() => {
-    if (!bucketsRaw.length) return 50;
-    return Math.round(
-      bucketsRaw.reduce(
-        (acc, b) => acc + b.risk_score * (b.allocation_usd / capital),
-        0
-      )
-    );
-  })();
+  // Respect max_positions by truncating if needed
+  const allocations = legs.slice(0, maxPositions);
 
-  const rebalancing = {
-    suggested_frequency_days:
-      horizonDays <= 30 ? 7 : horizonDays <= 90 ? 14 : 30,
-    triggers: [
-      'Any position exceeding its maximum allowed weight by >25%.',
-      'Sharp change in yield profile (>50% APY change in short window).',
-      'Material protocol risk event (exploit, governance drama, depeg).'
-    ]
-  };
+  // Compute simple weighted portfolio APY and risk score
+  let estimatedPortfolioApy = 0;
+  let estimatedRiskScore = 0;
 
-  const scenarioAnalysis = {
-    horizon_days: horizonDays,
-    bear_case_return_pct: Math.round((estimatedPortfolioApyMid * 0.2) * (horizonDays / 365)),
-    base_case_return_pct: Math.round((estimatedPortfolioApyMid * 0.8) * (horizonDays / 365)),
-    bull_case_return_pct: Math.round((estimatedPortfolioApyMid * 1.6) * (horizonDays / 365)),
-    commentary:
-      'Returns are expressed as non-annualized estimates over the provided horizon, based on synthetic APY assumptions. Use as planning guidance only.'
-  };
+  if (capital > 0 && allocations.length > 0) {
+    allocations.forEach((leg) => {
+      const weight = leg.allocation_usd / capital;
+      estimatedPortfolioApy += leg.est_apy * weight;
+
+      // crude synthetic risk: function of APY
+      const risk =
+        leg.est_apy < 8 ? 20 : leg.est_apy < 20 ? 45 : 70;
+      estimatedRiskScore += risk * weight;
+    });
+  }
+
+  estimatedPortfolioApy = Math.round(estimatedPortfolioApy * 10) / 10;
+  estimatedRiskScore = Math.round(estimatedRiskScore);
 
   return {
     job_name: 'portfolio_yield_allocation_plan',
     chain,
     starting_capital_usd: capital,
     risk_tolerance: rt,
-    preferences_applied: prefs,
     timestamp_utc: nowIso(),
-    estimated_portfolio_apy_mid_pct: Math.round(estimatedPortfolioApyMid * 10) / 10,
-    estimated_portfolio_risk_score: estimatedRiskScore,
-    buckets_view: bucketsRaw,
-    position_allocations_view: allocations.slice(0, maxPositions),
-    rebalancing_policy: rebalancing,
-    scenario_analysis: scenarioAnalysis,
-    validation_passed: valid,
+    estimated_portfolio_apy: estimatedPortfolioApy,
+    estimated_risk_score: estimatedRiskScore,
+    allocations,
+    // extra:
+    validation_passed: validationPassed,
     validation_errors: errors
   };
 }
 
-// ---------- JOB 3: execution_bundle_builder ----------
+/* ----------------- JOB 3: execution_bundle_builder ----------------- */
+/*
+Requirement:
+- client_agent_id: string
+- chain: string
+- desired_allocations: [
+    {
+      asset_in, asset_out, amount_in, venue,
+      slippage_bps, deadline_seconds, prefer_batching
+    }
+  ]
+
+Deliverable:
+- job_name: "execution_bundle_builder"
+- chain, timestamp_utc, bundle_id, estimated_gas_cost_usd, txs
+- txs: [
+    {
+      description, to, data, value, gas_limit_hint, warnings[]
+    }
+  ]
+*/
 
 function validateExecutionBundle(input) {
   const errors = [];
+
   if (!ensureString(input.client_agent_id)) {
     errors.push(validationError('client_agent_id must be string', 'client_agent_id'));
   }
@@ -586,49 +381,58 @@ function validateExecutionBundle(input) {
     errors.push(validationError('chain must be string', 'chain'));
   }
   if (!ensureArray(input.desired_allocations)) {
-    errors.push(validationError('desired_allocations must be array', 'desired_allocations'));
+    errors.push(
+      validationError('desired_allocations must be array', 'desired_allocations')
+    );
   } else {
     input.desired_allocations.forEach((item, idx) => {
+      const prefix = `desired_allocations[${idx}]`;
+
       if (!ensureString(item.asset_in)) {
-        errors.push(validationError(
-          `desired_allocations[${idx}].asset_in must be string`,
-          `desired_allocations.${idx}.asset_in`
-        ));
+        errors.push(
+          validationError(`${prefix}.asset_in must be string`, `${prefix}.asset_in`)
+        );
       }
       if (!ensureString(item.asset_out)) {
-        errors.push(validationError(
-          `desired_allocations[${idx}].asset_out must be string`,
-          `desired_allocations.${idx}.asset_out`
-        ));
+        errors.push(
+          validationError(`${prefix}.asset_out must be string`, `${prefix}.asset_out`)
+        );
       }
       if (!ensureNumber(item.amount_in)) {
-        errors.push(validationError(
-          `desired_allocations[${idx}].amount_in must be number`,
-          `desired_allocations.${idx}.amount_in`
-        ));
+        errors.push(
+          validationError(`${prefix}.amount_in must be number`, `${prefix}.amount_in`)
+        );
       }
       if (!ensureString(item.venue)) {
-        errors.push(validationError(
-          `desired_allocations[${idx}].venue must be string`,
-          `desired_allocations.${idx}.venue`
-        ));
+        errors.push(
+          validationError(`${prefix}.venue must be string`, `${prefix}.venue`)
+        );
+      }
+      if (!ensureNumber(item.slippage_bps)) {
+        errors.push(
+          validationError(
+            `${prefix}.slippage_bps must be number`,
+            `${prefix}.slippage_bps`
+          )
+        );
+      }
+      if (!ensureNumber(item.deadline_seconds)) {
+        errors.push(
+          validationError(
+            `${prefix}.deadline_seconds must be number`,
+            `${prefix}.deadline_seconds`
+          )
+        );
+      }
+      if (!ensureBoolean(item.prefer_batching)) {
+        errors.push(
+          validationError(
+            `${prefix}.prefer_batching must be boolean`,
+            `${prefix}.prefer_batching`
+          )
+        );
       }
     });
-  }
-
-  // Optional global knobs; only type-check if present
-  if (input.slippage_bps !== undefined && !ensureNumber(input.slippage_bps)) {
-    errors.push(validationError('slippage_bps must be number when provided', 'slippage_bps'));
-  }
-  if (input.deadline_seconds !== undefined && !ensureNumber(input.deadline_seconds)) {
-    errors.push(
-      validationError('deadline_seconds must be number when provided', 'deadline_seconds')
-    );
-  }
-  if (input.prefer_batching !== undefined && !ensureBoolean(input.prefer_batching)) {
-    errors.push(
-      validationError('prefer_batching must be boolean when provided', 'prefer_batching')
-    );
   }
 
   return errors;
@@ -636,116 +440,94 @@ function validateExecutionBundle(input) {
 
 function handleExecutionBundle(input) {
   const errors = validateExecutionBundle(input);
-  const valid = errors.length === 0;
+  const validationPassed = errors.length === 0;
 
   const chain = input.chain || 'unknown';
+  const allocations = ensureArray(input.desired_allocations)
+    ? input.desired_allocations
+    : [];
   const bundleId = `bundle_${chain}_${Date.now()}`;
 
-  // Use provided values if present, otherwise default
-  const slippageBps = input.slippage_bps ?? 50;
-  const deadlineSeconds = input.deadline_seconds ?? 900;
-  const preferBatching =
-    typeof input.prefer_batching === 'boolean' ? input.prefer_batching : true;
-
-  function inferActionType(alloc) {
-    const venue = alloc.venue.toLowerCase();
-    const out = alloc.asset_out.toUpperCase();
-    if (venue.includes('lend') || venue.includes('aave') || venue.includes('compound')) {
-      return 'supply_or_borrow';
-    }
-    if (venue.includes('lp') || out.includes('-LP') || out.includes('/')) {
-      return 'add_liquidity';
-    }
-    if (venue.includes('vault') || venue.includes('farm')) {
-      return 'vault_deposit';
-    }
-    return 'swap';
-  }
-
-  const txs = (input.desired_allocations || []).map((alloc, idx) => {
-    const actionType = inferActionType(alloc);
+  const txs = allocations.map((alloc, idx) => {
     const sizeCategory =
-      alloc.amount_in < 1_000
+      alloc.amount_in < 1000
         ? 'small'
-        : alloc.amount_in < 100_000
+        : alloc.amount_in < 100000
         ? 'medium'
         : 'large';
-    const priceImpactHint =
-      sizeCategory === 'small'
-        ? 'expected_low'
-        : sizeCategory === 'medium'
-        ? 'monitor'
-        : 'high_attention';
+
+    const warnings = [];
+
+    if (alloc.slippage_bps > 100) {
+      warnings.push(
+        `High slippage tolerance (${alloc.slippage_bps} bps); double-check price impact.`
+      );
+    }
+    if (alloc.deadline_seconds < 300) {
+      warnings.push(
+        `Short deadline (${alloc.deadline_seconds} seconds); may fail in volatile markets.`
+      );
+    }
+    if (!alloc.prefer_batching) {
+      warnings.push('Batching disabled; more individual txs may be required.');
+    }
+
+    if (sizeCategory === 'large') {
+      warnings.push('Large notional size; check venue depth and slippage carefully.');
+    }
 
     return {
-      index: idx,
-      description: `Execute ${actionType} from ${alloc.asset_in} → ${alloc.asset_out} on ${alloc.venue}`,
-      action_type: actionType,
-      to: `0xRouterOrProtocol${idx.toString().padStart(2, '0')}...`,
+      description: `Swap/route from ${alloc.asset_in} to ${alloc.asset_out} on ${alloc.venue}`,
+      to: `0xRouter${idx.toString().padStart(2, '0')}Address`,
       data: `0x${(1000 + idx).toString(16)}deadbeef`,
       value: '0',
-      gas_limit_hint: actionType === 'swap' ? 220000 : 350000,
-      meta: {
-        chain,
-        venue: alloc.venue,
-        asset_in: alloc.asset_in,
-        asset_out: alloc.asset_out,
-        notional_estimate_usd: alloc.amount_in,
-        size_category: sizeCategory,
-        price_impact_hint: priceImpactHint,
-        slippage_bps: slippageBps,
-        deadline_seconds: deadlineSeconds
-      }
+      gas_limit_hint: alloc.venue.toLowerCase().includes('lend') ? 350000 : 220000,
+      warnings
     };
   });
 
-  const estimatedGasUsd = Math.round(txs.length * 1.75 * 100) / 100;
-
-  const operational_risks = [
-    'Route selection is synthetic; validate routers and paths before signing.',
-    'Ensure slippage and deadlines are aligned with current liquidity conditions.',
-    'Run a dry-run / simulation on test environment if changing venues or assets.'
-  ];
-
-  const batchingPlan = preferBatching
-    ? {
-        strategy: 'batch_by_venue',
-        rationale:
-          'Group interactions per venue to reduce overhead and limit nonce management complexity.',
-        tentative_batches: txs.reduce((acc, tx) => {
-          const venue = tx.meta.venue;
-          if (!acc[venue]) acc[venue] = [];
-          acc[venue].push(tx.index);
-          return acc;
-        }, {})
-      }
-    : {
-        strategy: 'sequential_execution',
-        rationale:
-          'Execute in deterministic order for simpler monitoring and rollback reasoning.'
-      };
+  const estimatedGasCostUsd =
+    Math.round(txs.length * 1.5 * 100) / 100; // simple synthetic estimate
 
   return {
     job_name: 'execution_bundle_builder',
     chain,
     timestamp_utc: nowIso(),
     bundle_id: bundleId,
-    slippage_bps_applied: slippageBps,
-    deadline_seconds_applied: deadlineSeconds,
-    prefer_batching: preferBatching,
-    estimated_gas_cost_usd: estimatedGasUsd,
+    estimated_gas_cost_usd: estimatedGasCostUsd,
     txs,
-    batching_plan: batchingPlan,
-    operational_risks,
-    validation_passed: valid,
+    // extra:
+    validation_passed: validationPassed,
     validation_errors: errors
   };
 }
 
-// ---------- JOB 4: position_health_monitor ----------
+/* ----------------- JOB 4: position_health_monitor ----------------- */
+/*
+Requirement:
+- client_agent_id: string
+- chain: string
+- positions: [
+    {
+      protocol, pool_address, position_id,
+      health_threshold, notify_channel, check_frequency_minutes
+    }
+  ]
+
+Deliverable:
+- job_name: "position_health_monitor"
+- chain, timestamp_utc,
+  positions: [
+    {
+      protocol, pool_address, position_id,
+      health_score, breach, issues[], recommendation
+    }
+  ]
+*/
 
 function validatePositionHealth(input) {
   const errors = [];
+
   if (!ensureString(input.client_agent_id)) {
     errors.push(validationError('client_agent_id must be string', 'client_agent_id'));
   }
@@ -756,148 +538,133 @@ function validatePositionHealth(input) {
     errors.push(validationError('positions must be array', 'positions'));
   } else {
     input.positions.forEach((pos, idx) => {
+      const prefix = `positions[${idx}]`;
       if (!ensureString(pos.protocol)) {
-        errors.push(validationError(
-          `positions[${idx}].protocol must be string`,
-          `positions.${idx}.protocol`
-        ));
+        errors.push(
+          validationError(`${prefix}.protocol must be string`, `${prefix}.protocol`)
+        );
       }
       if (!ensureString(pos.pool_address)) {
-        errors.push(validationError(
-          `positions[${idx}].pool_address must be string`,
-          `positions.${idx}.pool_address`
-        ));
+        errors.push(
+          validationError(
+            `${prefix}.pool_address must be string`,
+            `${prefix}.pool_address`
+          )
+        );
       }
       if (!ensureString(pos.position_id)) {
-        errors.push(validationError(
-          `positions[${idx}].position_id must be string`,
-          `positions.${idx}.position_id`
-        ));
+        errors.push(
+          validationError(
+            `${prefix}.position_id must be string`,
+            `${prefix}.position_id`
+          )
+        );
       }
       if (!ensureNumber(pos.health_threshold)) {
-        errors.push(validationError(
-          `positions[${idx}].health_threshold must be number`,
-          `positions.${idx}.health_threshold`
-        ));
+        errors.push(
+          validationError(
+            `${prefix}.health_threshold must be number`,
+            `${prefix}.health_threshold`
+          )
+        );
+      }
+      if (!ensureString(pos.notify_channel)) {
+        errors.push(
+          validationError(
+            `${prefix}.notify_channel must be string`,
+            `${prefix}.notify_channel`
+          )
+        );
+      }
+      if (!ensureNumber(pos.check_frequency_minutes)) {
+        errors.push(
+          validationError(
+            `${prefix}.check_frequency_minutes must be number`,
+            `${prefix}.check_frequency_minutes`
+          )
+        );
       }
     });
   }
-  if (!ensureString(input.notify_channel)) {
-    errors.push(validationError('notify_channel must be string', 'notify_channel'));
-  }
-  if (!ensureNumber(input.check_frequency_minutes)) {
-    errors.push(
-      validationError('check_frequency_minutes must be number', 'check_frequency_minutes')
-    );
-  }
+
   return errors;
 }
 
 function handlePositionHealth(input) {
   const errors = validatePositionHealth(input);
-  const valid = errors.length === 0;
+  const validationPassed = errors.length === 0;
 
   const chain = input.chain || 'unknown';
-  const positions = input.positions || [];
-  const checkFreq = input.check_frequency_minutes || 15;
+  const positionsIn = ensureArray(input.positions) ? input.positions : [];
 
-  const snapshots = positions.map((pos) => {
+  const positionsOut = positionsIn.map((pos) => {
     const threshold = pos.health_threshold;
-    const baseHealth = threshold >= 80 ? 72 : threshold >= 60 ? 78 : 85;
-    const liquidationBufferPct =
-      baseHealth >= 80 ? 30 : baseHealth >= 70 ? 20 : 10;
+    // crude synthetic health model
+    let health = 80;
 
-    const breach = baseHealth < threshold;
-
-    const severity =
-      baseHealth >= threshold + 10
-        ? 'info'
-        : baseHealth >= threshold
-        ? 'watch'
-        : baseHealth >= threshold - 10
-        ? 'warning'
-        : 'critical';
-
-    const issues = [];
-    const recommendedActions = [];
-
-    if (breach) {
-      issues.push('Synthetic breach: health score below configured threshold.');
-      recommendedActions.push(
-        'Evaluate options: partial deleveraging, collateral top-up, or closing position.'
-      );
-    } else if (severity === 'warning') {
-      issues.push('Health score is within 10 points of threshold; risk is non-trivial.');
-      recommendedActions.push(
-        'Increase monitoring frequency and pre-plan deleveraging triggers.'
-      );
-    } else if (severity === 'watch') {
-      issues.push('Health score only slightly above threshold.');
-      recommendedActions.push(
-        'Define automated alert if health score drops by additional 5–10 points.'
-      );
+    if (threshold >= 80) {
+      health = threshold - 5;
+    } else if (threshold >= 60) {
+      health = threshold + 5;
     } else {
-      recommendedActions.push(
-        'No immediate action suggested; maintain baseline monitoring.'
-      );
+      health = threshold + 15;
     }
 
-    recommendedActions.push(
-      'If using perps/options elsewhere, tag this position as reference and consider offsetting directional risk.'
-    );
+    health = Math.max(0, Math.min(100, Math.round(health)));
+
+    const breach = health < threshold;
+    const issues = [];
+    let recommendation = 'No immediate action required. Maintain baseline monitoring.';
+
+    if (breach) {
+      issues.push('Synthetic health score is below configured threshold.');
+      recommendation =
+        'Consider reducing leverage, adding collateral, or unwinding the position.';
+    } else if (health - threshold < 5) {
+      issues.push('Health score is only slightly above threshold.');
+      recommendation =
+        'Increase monitoring frequency and prepare a risk-reduction playbook.';
+    }
 
     return {
       protocol: pos.protocol,
       pool_address: pos.pool_address,
       position_id: pos.position_id,
-      chain,
-      synthetic_health_score: baseHealth,
-      configured_health_threshold: threshold,
-      liquidation_buffer_pct: liquidationBufferPct,
+      health_score: health,
       breach,
-      severity,
       issues,
-      recommended_actions: recommendedActions
+      recommendation
     };
   });
-
-  const totalPositions = snapshots.length;
-  const breachedCount = snapshots.filter((s) => s.breach).length;
-  const nearThresholdCount = snapshots.filter(
-    (s) => !s.breach && s.synthetic_health_score < s.configured_health_threshold + 5
-  ).length;
-
-  const portfolioSummary = {
-    total_positions: totalPositions,
-    breached_positions: breachedCount,
-    near_threshold_positions: nearThresholdCount,
-    monitoring_frequency_minutes: checkFreq,
-    monitoring_channel: input.notify_channel,
-    portfolio_risk_commentary:
-      totalPositions === 0
-        ? 'No positions provided; nothing to monitor.'
-        : breachedCount > 0
-        ? 'One or more positions are synthetically below threshold; define clear deleveraging / unwind playbook.'
-        : nearThresholdCount > 0
-        ? 'Some positions are hovering near risk guardrail; tighten alerting and review sizing.'
-        : 'All positions have comfortable synthetic health margins given the configured thresholds.'
-  };
 
   return {
     job_name: 'position_health_monitor',
     chain,
     timestamp_utc: nowIso(),
-    positions: snapshots,
-    portfolio_summary: portfolioSummary,
-    validation_passed: valid,
+    positions: positionsOut,
+    // extra:
+    validation_passed: validationPassed,
     validation_errors: errors
   };
 }
 
-// ---------- JOB 5: strategy_backtest_report ----------
+/* ----------------- JOB 5: strategy_backtest_report ----------------- */
+/*
+Requirement:
+- client_agent_id, chain, strategy_name,
+  backtest_start_utc, backtest_end_utc,
+  initial_capital_usd, simulated_actions[]
+
+Deliverable:
+- job_name: "strategy_backtest_report"
+- chain, strategy_name, timestamp_utc,
+  total_return_pct, max_drawdown_pct, volatility_pct,
+  trade_count, equity_curve[ { timestamp_utc, equity_usd, key_events[] } ]
+*/
 
 function validateBacktest(input) {
   const errors = [];
+
   if (!ensureString(input.client_agent_id)) {
     errors.push(validationError('client_agent_id must be string', 'client_agent_id'));
   }
@@ -905,16 +672,24 @@ function validateBacktest(input) {
     errors.push(validationError('chain must be string', 'chain'));
   }
   if (!ensureString(input.strategy_name)) {
-    errors.push(validationError('strategy_name must be string', 'strategy_name'));
+    errors.push(
+      validationError('strategy_name must be string', 'strategy_name')
+    );
   }
   if (!ensureString(input.backtest_start_utc)) {
-    errors.push(validationError('backtest_start_utc must be string', 'backtest_start_utc'));
+    errors.push(
+      validationError('backtest_start_utc must be string', 'backtest_start_utc')
+    );
   }
   if (!ensureString(input.backtest_end_utc)) {
-    errors.push(validationError('backtest_end_utc must be string', 'backtest_end_utc'));
+    errors.push(
+      validationError('backtest_end_utc must be string', 'backtest_end_utc')
+    );
   }
   if (!ensureNumber(input.initial_capital_usd)) {
-    errors.push(validationError('initial_capital_usd must be number', 'initial_capital_usd'));
+    errors.push(
+      validationError('initial_capital_usd must be number', 'initial_capital_usd')
+    );
   }
   if (!ensureArray(input.simulated_actions)) {
     errors.push(
@@ -925,17 +700,22 @@ function validateBacktest(input) {
       validationError('simulated_actions items must be strings', 'simulated_actions')
     );
   }
+
   return errors;
 }
 
 function handleBacktest(input) {
   const errors = validateBacktest(input);
-  const valid = errors.length === 0;
+  const validationPassed = errors.length === 0;
 
   const chain = input.chain || 'unknown';
   const strategyName = input.strategy_name || 'unknown';
-  const initialCapital = input.initial_capital_usd || 0;
-  const actions = input.simulated_actions || [];
+  const initialCapital = ensureNumber(input.initial_capital_usd)
+    ? input.initial_capital_usd
+    : 0;
+  const actions = ensureArray(input.simulated_actions)
+    ? input.simulated_actions
+    : [];
 
   const start = new Date(input.backtest_start_utc);
   const end = new Date(input.backtest_end_utc);
@@ -944,15 +724,13 @@ function handleBacktest(input) {
       ? 30
       : Math.max(1, Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)));
 
+  // Very simple synthetic performance model
   const complexityFactor = Math.min(3, Math.max(0.5, actions.length / 10));
   const baseAnnualReturn =
     complexityFactor <= 0.8 ? 0.08 : complexityFactor <= 1.5 ? 0.18 : 0.3;
 
   const syntheticEdge =
-    strategyName.toLowerCase().includes('delta-neutral') ||
-    strategyName.toLowerCase().includes('market-neutral')
-      ? 0.02
-      : 0;
+    strategyName.toLowerCase().includes('neutral') ? 0.02 : 0;
   const syntheticDrag =
     strategyName.toLowerCase().includes('degen') ||
     strategyName.toLowerCase().includes('leveraged')
@@ -962,6 +740,12 @@ function handleBacktest(input) {
   const netAnnualReturn = baseAnnualReturn + syntheticEdge - syntheticDrag;
   const periodReturn = netAnnualReturn * (days / 365);
   const endEquity = initialCapital * (1 + periodReturn);
+
+  const totalReturnPct =
+    initialCapital > 0
+      ? ((endEquity - initialCapital) / initialCapital) * 100
+      : 0;
+
   const maxDrawdownPct = Math.min(
     60,
     Math.max(8, 25 * complexityFactor + (syntheticDrag > 0 ? 10 : 0))
@@ -971,54 +755,23 @@ function handleBacktest(input) {
     Math.max(12, 30 * complexityFactor + (syntheticDrag > 0 ? 10 : 0))
   );
 
-  const totalReturnPct =
-    initialCapital > 0
-      ? ((endEquity - initialCapital) / initialCapital) * 100
-      : 0;
-
-  const annualizedReturnPct = periodReturn * (365 / days) * 100;
-  const sharpeRatioEstimate =
-    volatilityPct > 0
-      ? ((annualizedReturnPct - 5) / volatilityPct).toFixed(2)
-      : '0.00';
-
   const steps = [0, 0.25, 0.5, 0.75, 1];
-  const equityCurve = steps.map((f) => {
-    const t = new Date(
-      start.getTime() + f * (end.getTime() - start.getTime())
-    ).toISOString();
+  const equityCurve = steps.map((f, idx) => {
+    const tMs = start.getTime() + f * (end.getTime() - start.getTime());
+    const tIso = new Date(tMs).toISOString();
     const equity = initialCapital * (1 + periodReturn * f);
+
+    const keyEvents = [];
+    if (idx === 0) keyEvents.push('Backtest started.');
+    if (idx === steps.length - 1) keyEvents.push('Backtest ended.');
+    if (idx === 2) keyEvents.push('Mid-horizon synthetic volatility spike.');
+
     return {
-      timestamp_utc: t,
-      equity_usd: Math.round(equity * 100) / 100
+      timestamp_utc: tIso,
+      equity_usd: Math.round(equity * 100) / 100,
+      key_events: keyEvents
     };
   });
-
-  const bestDayReturnPct = (volatilityPct / 4).toFixed(2);
-  const worstDayReturnPct = (-volatilityPct / 3).toFixed(2);
-
-  const riskCommentary = [
-    totalReturnPct >= 0
-      ? 'Synthetic results show profitable behavior over the backtest window, but with non-trivial drawdown risk.'
-      : 'Synthetic results show underperformance; consider whether the edge is structural or path-dependent.',
-    `Max drawdown is modeled at ~${maxDrawdownPct.toFixed(
-      1
-    )}% with volatility ~${volatilityPct.toFixed(
-      1
-    )}%. This implies that realized PnL can deviate substantially from average return.`,
-    'Use this backtest as a sanity check on position sizing and risk budget, not as a guarantee of forward returns.'
-  ];
-
-  const parameterEcho = {
-    horizon_days: days,
-    simulated_action_count: actions.length,
-    complexity_factor_used: complexityFactor,
-    assumptions: {
-      base_annual_return_pct: (baseAnnualReturn * 100).toFixed(2),
-      synthetic_edge_pct: (syntheticEdge * 100).toFixed(2),
-      synthetic_drag_pct: (syntheticDrag * 100).toFixed(2)
-    }
-  };
 
   return {
     job_name: 'strategy_backtest_report',
@@ -1026,26 +779,17 @@ function handleBacktest(input) {
     strategy_name: strategyName,
     timestamp_utc: nowIso(),
     total_return_pct: Math.round(totalReturnPct * 10) / 10,
-    annualized_return_pct: Math.round(annualizedReturnPct * 10) / 10,
     max_drawdown_pct: Math.round(maxDrawdownPct * 10) / 10,
     volatility_pct: Math.round(volatilityPct * 10) / 10,
-    sharpe_ratio_estimate,
     trade_count: Math.max(1, actions.length * 3),
-    best_day_return_pct,
-    worst_day_return_pct,
-    equity_curve,
-    parameter_echo: parameterEcho,
-    risk_commentary,
-    key_events: [
-      'Synthetic backtest: replace with real historical series when wiring to production data.',
-      'No liquidation modeling included; this should be layered on top for leveraged strategies.'
-    ],
-    validation_passed: valid,
+    equity_curve: equityCurve,
+    // extra:
+    validation_passed: validationPassed,
     validation_errors: errors
   };
 }
 
-// ---------- Job router ----------
+/* ------------------------- Job router ------------------------- */
 
 function routeJobDeliverable(metadata) {
   if (!metadata || typeof metadata !== 'object') {
@@ -1085,7 +829,7 @@ function routeJobDeliverable(metadata) {
   }
 }
 
-// ---------- Main ACP bootstrap (V2) ----------
+/* ---------------------- ACP bootstrap (V2) ---------------------- */
 
 async function main() {
   const privateKey = process.env.WHITELISTED_WALLET_PRIVATE_KEY;
@@ -1094,7 +838,7 @@ async function main() {
 
   if (!privateKey || !sellerEntityId || !sellerWalletAddress) {
     throw new Error(
-      'Missing environment variables. Check .env: WHITELISTED_WALLET_PRIVATE_KEY, SELLER_ENTITY_ID, SELLER_AGENT_WALLET_ADDRESS'
+      'Missing env vars. Check .env: WHITELISTED_WALLET_PRIVATE_KEY, SELLER_ENTITY_ID, SELLER_AGENT_WALLET_ADDRESS'
     );
   }
 
@@ -1137,7 +881,7 @@ async function main() {
           }
 
           console.log('🤝 Responding to job (accepting)...');
-          await job.respond(true, 'Auto-accepting job from DeFi Yield Optimizer provider');
+          await job.respond(true, 'Auto-accepting job from YieldPilot provider');
           console.log('✅ Job accepted:', job.id);
         } catch (err) {
           console.error('❌ Error accepting job:', err);
@@ -1210,14 +954,14 @@ async function main() {
     }
   });
 
-  console.log('🚀 Initializing ACP client for DeFi Yield Optimizer (V2)...');
+  console.log('🚀 Initializing ACP client for YieldPilot...');
   if (typeof acpClient.init === 'function') {
     await acpClient.init();
   }
   console.log('🟢 ACP client initialized. Waiting for jobs...');
 
   setInterval(() => {
-    console.log('⏱ Heartbeat: DeFi Yield Optimizer provider is still running...');
+    console.log('⏱ Heartbeat: YieldPilot provider is still running...');
   }, 60000);
 }
 
